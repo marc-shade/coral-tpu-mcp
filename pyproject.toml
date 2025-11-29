@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coral-tpu-mcp"
+version = "0.1.0"
+description = "Coral TPU MCP Server - Fast local ML inference for agentic systems"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Marc", email = "marc@macpro51.local"}
+]
+keywords = ["coral", "tpu", "mcp", "edge-ml", "inference"]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    # pycoral and tflite-runtime installed separately in coral-venv
+]
+
+[project.optional-dependencies]
+text = [
+    "sentence-transformers>=2.2.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+coral-tpu-mcp = "coral_tpu_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.txt"]
