@@ -657,6 +657,128 @@ async def handle_detect_anomaly(args: Dict) -> List[TextContent]:
     }))]
 
 
+async def handle_spot_keyword(args: Dict) -> List[TextContent]:
+    """Detect keywords in audio using TPU keyword spotter model."""
+    engine = get_engine()
+
+    if not engine.is_available:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "TPU not available",
+            "keywords": []
+        }))]
+
+    threshold = args.get("threshold", 0.5)
+
+    try:
+        import librosa
+        import scipy.io.wavfile as wavfile
+
+        # Load audio data
+        if "audio_base64" in args:
+            audio_bytes = base64.b64decode(args["audio_base64"])
+            # Assume 16-bit PCM 16kHz
+            audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            sr = 16000
+        elif "audio_path" in args:
+            audio_path = args["audio_path"]
+            if audio_path.endswith('.wav'):
+                sr_orig, audio_raw = wavfile.read(audio_path)
+                audio_data = audio_raw.astype(np.float32) / 32768.0
+                if sr_orig != 16000:
+                    audio_data = librosa.resample(audio_data, orig_sr=sr_orig, target_sr=16000)
+                sr = 16000
+            else:
+                audio_data, sr = librosa.load(audio_path, sr=16000, mono=True)
+        else:
+            return [TextContent(type="text", text=json.dumps({
+                "error": "Must provide audio_base64 or audio_path",
+                "keywords": []
+            }))]
+
+        # Ensure we have 2 seconds of audio (pad or trim)
+        target_length = 2 * sr  # 2 seconds at 16kHz = 32000 samples
+        if len(audio_data) < target_length:
+            audio_data = np.pad(audio_data, (0, target_length - len(audio_data)))
+        else:
+            audio_data = audio_data[:target_length]
+
+        # Generate mel spectrogram (32 mel bins, 10ms hop)
+        hop_length = int(0.01 * sr)  # 10ms
+        n_fft = 1024
+        n_mels = 32
+
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio_data, sr=sr, n_fft=n_fft,
+            hop_length=hop_length, n_mels=n_mels
+        )
+        log_mel = librosa.power_to_db(mel_spec, ref=np.max)
+
+        # Normalize to uint8 for quantized model
+        log_mel_norm = ((log_mel - log_mel.min()) / (log_mel.max() - log_mel.min() + 1e-8) * 255).astype(np.uint8)
+
+        # Transpose to (time, mel) and reshape for model
+        features = log_mel_norm.T  # Shape: (time_steps, 32)
+
+        start = time.perf_counter()
+
+        # Load keyword spotter model
+        config = MODELS["keyword_spotter"]
+        if not engine.load_model(config["file"]):
+            return [TextContent(type="text", text=json.dumps({
+                "error": "Failed to load keyword spotter model",
+                "keywords": []
+            }))]
+
+        # Get input shape and resize features if needed
+        input_details = engine.get_input_details(config["file"])
+        if input_details:
+            expected_shape = input_details["shape"]
+            # Reshape features to match expected input (typically [1, time, mels])
+            if len(expected_shape) == 3:
+                # Resize time dimension if needed
+                target_time = expected_shape[1]
+                if features.shape[0] != target_time:
+                    # Resample time dimension
+                    indices = np.linspace(0, features.shape[0]-1, target_time).astype(int)
+                    features = features[indices]
+                features = features.reshape(1, target_time, n_mels)
+
+        # Run inference
+        result = engine.classify(config["file"], features, top_k=5, threshold=threshold)
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        # Filter by threshold and format results
+        keywords = []
+        for pred in result.predictions:
+            if pred["score"] >= threshold:
+                keywords.append({
+                    "keyword": pred.get("label", f"class_{pred['class_id']}"),
+                    "confidence": pred["score"],
+                    "class_id": pred["class_id"]
+                })
+
+        return [TextContent(type="text", text=json.dumps({
+            "keywords": keywords,
+            "latency_ms": latency_ms,
+            "audio_duration_sec": len(audio_data) / sr,
+            "threshold": threshold,
+            "tpu_used": True
+        }))]
+
+    except ImportError as e:
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Missing audio library: {e}. Install librosa: pip install librosa",
+            "keywords": []
+        }))]
+    except Exception as e:
+        logger.exception("Keyword spotting error")
+        return [TextContent(type="text", text=json.dumps({
+            "error": str(e),
+            "keywords": []
+        }))]
+
+
 async def _load_models_background():
     """Load models in background after server starts."""
     await asyncio.sleep(0.1)  # Let server start first
