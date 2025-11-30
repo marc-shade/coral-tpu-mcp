@@ -191,11 +191,11 @@ class TPUEngine:
         predictions = []
         for c in classes:
             pred = {
-                "class_id": c.id,
+                "class_id": int(c.id),  # Convert numpy int64 to Python int for JSON
                 "score": float(c.score)
             }
-            if labels and c.id < len(labels):
-                pred["label"] = labels[c.id]
+            if labels and int(c.id) < len(labels):
+                pred["label"] = labels[int(c.id)]
             predictions.append(pred)
 
         # Update stats
