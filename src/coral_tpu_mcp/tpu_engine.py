@@ -199,7 +199,7 @@ class TPUEngine:
             predictions.append(pred)
 
         # Update stats
-        self._update_stats(model_name, latency_ms)
+        self._update_stats(model_name, latency_ms, operation="classification")
 
         return InferenceResult(
             predictions=predictions,
@@ -252,7 +252,7 @@ class TPUEngine:
         embedding = interpreter.get_tensor(output_detail["index"])
 
         # Update stats
-        self._update_stats(model_name, latency_ms)
+        self._update_stats(model_name, latency_ms, operation="embedding")
 
         return embedding.flatten(), latency_ms
 
