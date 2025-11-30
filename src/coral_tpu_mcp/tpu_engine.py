@@ -24,6 +24,18 @@ try:
 except ImportError:
     _HAS_XRG_STATS = False
     _xrg_record = None
+
+# TPU monitor for historical usage tracking
+try:
+    import sys as _sys
+    _hooks_path = os.path.join(os.environ.get("AGENTIC_SYSTEM_PATH", "/mnt/agentic-system"), "scripts/hooks")
+    if _hooks_path not in _sys.path:
+        _sys.path.insert(0, _hooks_path)
+    from tpu_monitor import record_tpu_usage as _record_tpu_usage
+    _HAS_TPU_MONITOR = True
+except ImportError:
+    _HAS_TPU_MONITOR = False
+    _record_tpu_usage = None
 from pycoral.utils.dataset import read_label_file
 from pycoral.adapters import common, classify
 
@@ -244,7 +256,7 @@ class TPUEngine:
 
         return embedding.flatten(), latency_ms
 
-    def _update_stats(self, model_name: str, latency_ms: float):
+    def _update_stats(self, model_name: str, latency_ms: float, operation: str = "inference"):
         """Update inference statistics."""
         self.stats["total_inferences"] += 1
         self.stats["total_latency_ms"] += latency_ms
@@ -259,6 +271,19 @@ class TPUEngine:
         else:
             # Fallback: persist stats directly for cross-process access
             self._quick_persist(model_name=model_name, latency_ms=latency_ms)
+
+        # Record to TPU monitor for historical tracking
+        if _HAS_TPU_MONITOR and _record_tpu_usage:
+            try:
+                _record_tpu_usage(
+                    operation=operation,
+                    latency_ms=latency_ms,
+                    model=model_name,
+                    success=True,
+                    source="coral-tpu-mcp"
+                )
+            except Exception:
+                pass  # Don't let monitoring failures affect inference
 
     def get_stats(self) -> Dict[str, Any]:
         """Get inference statistics."""
