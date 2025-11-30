@@ -244,6 +244,28 @@ async def list_tools() -> List[Tool]:
                 },
                 "required": ["content"]
             }
+        ),
+        Tool(
+            name="spot_keyword",
+            description="Detect keywords/phrases in audio using TPU. Supports ~140 phrases like 'start', 'stop', 'next', 'previous'. Returns detected keywords with confidence.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "audio_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded raw audio data (16-bit PCM, 16kHz mono)"
+                    },
+                    "audio_path": {
+                        "type": "string",
+                        "description": "Path to WAV file (16kHz mono preferred)"
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "default": 0.5,
+                        "description": "Minimum confidence threshold for detection"
+                    }
+                }
+            }
         )
     ]
 
@@ -276,6 +298,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
         elif name == "detect_anomaly":
             return await handle_detect_anomaly(arguments)
+
+        elif name == "spot_keyword":
+            return await handle_spot_keyword(arguments)
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
