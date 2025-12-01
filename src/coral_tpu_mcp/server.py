@@ -489,6 +489,21 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         elif name == "spot_keyword":
             return await handle_spot_keyword(arguments)
 
+        elif name == "estimate_pose":
+            return await handle_estimate_pose(arguments)
+
+        elif name == "detect_objects":
+            return await handle_detect_objects(arguments)
+
+        elif name == "segment_image":
+            return await handle_segment_image(arguments)
+
+        elif name == "classify_audio":
+            return await handle_classify_audio(arguments)
+
+        elif name == "list_models":
+            return await handle_list_models(arguments)
+
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -964,6 +979,605 @@ async def handle_spot_keyword(args: Dict) -> List[TextContent]:
             "error": str(e),
             "keywords": []
         }))]
+
+
+async def handle_estimate_pose(args: Dict) -> List[TextContent]:
+    """Estimate human pose from image using TPU PoseNet/MoveNet models."""
+    engine = get_engine()
+
+    if not engine.is_available:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "TPU not available",
+            "keypoints": []
+        }))]
+
+    # Get model
+    model_key = args.get("model", "movenet")
+    if model_key not in ["movenet", "posenet_353", "posenet_481", "posenet_721"]:
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Unknown pose model: {model_key}. Use movenet, posenet_353, posenet_481, or posenet_721"
+        }))]
+
+    config = MODELS[model_key]
+
+    # Check if model file exists
+    model_path = MODELS_DIR / config["file"]
+    if not model_path.exists():
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Model file not found: {config['file']}. Download from coral.ai/models"
+        }))]
+
+    # Load model
+    if not engine.load_model(config["file"]):
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Failed to load pose model: {config['file']}"
+        }))]
+
+    # Get image data
+    if "image_base64" in args:
+        image_data = base64.b64decode(args["image_base64"])
+    elif "image_path" in args:
+        with open(args["image_path"], "rb") as f:
+            image_data = f.read()
+    else:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "Must provide image_base64 or image_path"
+        }))]
+
+    try:
+        # Preprocess image
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        original_size = image.size
+
+        # Resize to model input size
+        input_size = config["input_size"]
+        image_resized = image.resize(input_size, Image.Resampling.LANCZOS)
+        input_data = np.array(image_resized, dtype=np.uint8)
+
+        # Run inference
+        start = time.perf_counter()
+        interpreter = engine.interpreters[config["file"]]
+
+        from pycoral.adapters import common
+        common.set_input(interpreter, input_data)
+        interpreter.invoke()
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        # Get output tensors
+        output_details = interpreter.get_output_details()
+
+        # Parse pose output based on model type
+        keypoints = []
+
+        if model_key == "movenet":
+            # MoveNet outputs [1, 1, 17, 3] - (batch, num_poses, keypoints, [y, x, score])
+            output = interpreter.get_tensor(output_details[0]["index"])
+            poses = output[0, 0]  # First pose
+
+            for i, kp_name in enumerate(POSE_KEYPOINTS):
+                y, x, score = poses[i]
+                # Convert normalized coords to image coords
+                keypoints.append({
+                    "name": kp_name,
+                    "x": float(x) * original_size[0],
+                    "y": float(y) * original_size[1],
+                    "confidence": float(score)
+                })
+        else:
+            # PoseNet - different output format
+            # Output typically has heatmaps and offsets
+            if len(output_details) >= 4:
+                # Standard PoseNet outputs
+                heatmaps = interpreter.get_tensor(output_details[0]["index"])
+                offsets = interpreter.get_tensor(output_details[1]["index"])
+
+                # Simple peak detection from heatmaps
+                for i, kp_name in enumerate(POSE_KEYPOINTS):
+                    if i < heatmaps.shape[-1]:
+                        hm = heatmaps[0, :, :, i]
+                        max_idx = np.unravel_index(np.argmax(hm), hm.shape)
+                        score = float(hm[max_idx])
+
+                        # Convert to image coordinates
+                        y = (max_idx[0] / hm.shape[0]) * original_size[1]
+                        x = (max_idx[1] / hm.shape[1]) * original_size[0]
+
+                        keypoints.append({
+                            "name": kp_name,
+                            "x": float(x),
+                            "y": float(y),
+                            "confidence": score
+                        })
+            else:
+                # Fallback - raw output
+                output = interpreter.get_tensor(output_details[0]["index"]).flatten()
+                for i, kp_name in enumerate(POSE_KEYPOINTS[:min(17, len(output)//3)]):
+                    idx = i * 3
+                    keypoints.append({
+                        "name": kp_name,
+                        "x": float(output[idx]) * original_size[0],
+                        "y": float(output[idx + 1]) * original_size[1],
+                        "confidence": float(output[idx + 2]) if idx + 2 < len(output) else 0.5
+                    })
+
+        # Update stats
+        engine._update_stats(config["file"], latency_ms, operation="pose_estimation")
+
+        return [TextContent(type="text", text=json.dumps({
+            "keypoints": keypoints,
+            "num_keypoints": len(keypoints),
+            "model": model_key,
+            "latency_ms": latency_ms,
+            "image_size": original_size,
+            "tpu_used": True
+        }, indent=2))]
+
+    except Exception as e:
+        logger.exception("Pose estimation error")
+        return [TextContent(type="text", text=json.dumps({
+            "error": str(e),
+            "keypoints": []
+        }))]
+
+
+async def handle_detect_objects(args: Dict) -> List[TextContent]:
+    """Detect objects in image using TPU SSD model (90 COCO classes)."""
+    engine = get_engine()
+
+    if not engine.is_available:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "TPU not available",
+            "detections": []
+        }))]
+
+    config = MODELS["coco_detection"]
+    threshold = args.get("threshold", 0.4)
+    max_detections = args.get("max_detections", 10)
+
+    # Check if model exists
+    model_path = MODELS_DIR / config["file"]
+    if not model_path.exists():
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Model not found: {config['file']}. Download ssdlite_mobiledet_coco_edgetpu.tflite from coral.ai"
+        }))]
+
+    # Load model
+    if not engine.load_model(config["file"], config["labels"]):
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Failed to load detection model: {config['file']}"
+        }))]
+
+    # Get image data
+    if "image_base64" in args:
+        image_data = base64.b64decode(args["image_base64"])
+    elif "image_path" in args:
+        with open(args["image_path"], "rb") as f:
+            image_data = f.read()
+    else:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "Must provide image_base64 or image_path"
+        }))]
+
+    try:
+        # Preprocess
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        original_size = image.size
+        input_size = config["input_size"]
+        image_resized = image.resize(input_size, Image.Resampling.LANCZOS)
+        input_data = np.array(image_resized, dtype=np.uint8)
+
+        # Run inference
+        start = time.perf_counter()
+        interpreter = engine.interpreters[config["file"]]
+
+        from pycoral.adapters import common, detect
+        common.set_input(interpreter, input_data)
+        interpreter.invoke()
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        # Get detections using pycoral detect adapter
+        try:
+            objs = detect.get_objects(interpreter, threshold)
+        except Exception:
+            # Fallback: manual parsing
+            output_details = interpreter.get_output_details()
+            objs = []
+
+            # SSD outputs: boxes, classes, scores, count
+            boxes = interpreter.get_tensor(output_details[0]["index"])[0]
+            classes = interpreter.get_tensor(output_details[1]["index"])[0]
+            scores = interpreter.get_tensor(output_details[2]["index"])[0]
+            count = int(interpreter.get_tensor(output_details[3]["index"])[0])
+
+            class Object:
+                def __init__(self, id, score, bbox):
+                    self.id = id
+                    self.score = score
+                    self.bbox = bbox
+
+            class BBox:
+                def __init__(self, ymin, xmin, ymax, xmax):
+                    self.ymin, self.xmin = ymin, xmin
+                    self.ymax, self.xmax = ymax, xmax
+
+            for i in range(min(count, len(scores))):
+                if scores[i] >= threshold:
+                    ymin, xmin, ymax, xmax = boxes[i]
+                    objs.append(Object(int(classes[i]), float(scores[i]),
+                                      BBox(ymin, xmin, ymax, xmax)))
+
+        # Load labels
+        labels = engine.labels.get(config["file"], [])
+
+        # Format detections
+        detections = []
+        for obj in objs[:max_detections]:
+            if obj.score >= threshold:
+                # Convert normalized bbox to image coordinates
+                bbox = {
+                    "xmin": int(obj.bbox.xmin * original_size[0]),
+                    "ymin": int(obj.bbox.ymin * original_size[1]),
+                    "xmax": int(obj.bbox.xmax * original_size[0]),
+                    "ymax": int(obj.bbox.ymax * original_size[1])
+                }
+                label = labels[obj.id] if obj.id < len(labels) else f"class_{obj.id}"
+                detections.append({
+                    "label": label,
+                    "class_id": obj.id,
+                    "confidence": float(obj.score),
+                    "bbox": bbox
+                })
+
+        # Update stats
+        engine._update_stats(config["file"], latency_ms, operation="object_detection")
+
+        return [TextContent(type="text", text=json.dumps({
+            "detections": detections,
+            "num_detections": len(detections),
+            "latency_ms": latency_ms,
+            "image_size": original_size,
+            "threshold": threshold,
+            "tpu_used": True
+        }, indent=2))]
+
+    except Exception as e:
+        logger.exception("Object detection error")
+        return [TextContent(type="text", text=json.dumps({
+            "error": str(e),
+            "detections": []
+        }))]
+
+
+async def handle_segment_image(args: Dict) -> List[TextContent]:
+    """Perform semantic segmentation using DeepLab v3 TPU model."""
+    engine = get_engine()
+
+    if not engine.is_available:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "TPU not available"
+        }))]
+
+    config = MODELS["deeplabv3_pascal"]
+    return_mask = args.get("return_mask", False)
+
+    # Check if model exists
+    model_path = MODELS_DIR / config["file"]
+    if not model_path.exists():
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Model not found: {config['file']}. Download deeplabv3_pascal_edgetpu.tflite from coral.ai"
+        }))]
+
+    # Load model
+    if not engine.load_model(config["file"], config["labels"]):
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Failed to load segmentation model: {config['file']}"
+        }))]
+
+    # Get image data
+    if "image_base64" in args:
+        image_data = base64.b64decode(args["image_base64"])
+    elif "image_path" in args:
+        with open(args["image_path"], "rb") as f:
+            image_data = f.read()
+    else:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "Must provide image_base64 or image_path"
+        }))]
+
+    try:
+        # Pascal VOC class names
+        pascal_classes = [
+            "background", "aeroplane", "bicycle", "bird", "boat",
+            "bottle", "bus", "car", "cat", "chair", "cow",
+            "diningtable", "dog", "horse", "motorbike", "person",
+            "pottedplant", "sheep", "sofa", "train", "tvmonitor"
+        ]
+
+        # Preprocess
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        original_size = image.size
+        input_size = config["input_size"]
+        image_resized = image.resize(input_size, Image.Resampling.LANCZOS)
+        input_data = np.array(image_resized, dtype=np.uint8)
+
+        # Run inference
+        start = time.perf_counter()
+        interpreter = engine.interpreters[config["file"]]
+
+        from pycoral.adapters import common
+        common.set_input(interpreter, input_data)
+        interpreter.invoke()
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        # Get segmentation output
+        output_details = interpreter.get_output_details()
+        seg_output = interpreter.get_tensor(output_details[0]["index"])
+
+        # Get class per pixel (argmax)
+        if len(seg_output.shape) == 4:
+            seg_map = np.argmax(seg_output[0], axis=-1)
+        else:
+            seg_map = seg_output[0] if len(seg_output.shape) == 3 else seg_output
+
+        # Count pixels per class
+        unique, counts = np.unique(seg_map, return_counts=True)
+        total_pixels = seg_map.size
+
+        class_distribution = {}
+        for cls_id, count in zip(unique, counts):
+            cls_id = int(cls_id)
+            label = pascal_classes[cls_id] if cls_id < len(pascal_classes) else f"class_{cls_id}"
+            percentage = float(count) / total_pixels * 100
+            if percentage > 0.5:  # Only include classes with >0.5% coverage
+                class_distribution[label] = {
+                    "class_id": cls_id,
+                    "pixel_count": int(count),
+                    "percentage": round(percentage, 2)
+                }
+
+        # Update stats
+        engine._update_stats(config["file"], latency_ms, operation="segmentation")
+
+        result = {
+            "class_distribution": class_distribution,
+            "num_classes_detected": len(class_distribution),
+            "latency_ms": latency_ms,
+            "image_size": original_size,
+            "segmentation_size": list(seg_map.shape),
+            "tpu_used": True
+        }
+
+        # Optionally include full mask (can be large)
+        if return_mask:
+            result["segmentation_mask"] = seg_map.tolist()
+
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    except Exception as e:
+        logger.exception("Segmentation error")
+        return [TextContent(type="text", text=json.dumps({
+            "error": str(e)
+        }))]
+
+
+async def handle_classify_audio(args: Dict) -> List[TextContent]:
+    """Classify audio/sounds using YamNet TPU model (520+ classes)."""
+    engine = get_engine()
+
+    if not engine.is_available:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "TPU not available",
+            "predictions": []
+        }))]
+
+    config = MODELS["yamnet"]
+    top_k = args.get("top_k", 5)
+
+    # Check if model exists
+    model_path = MODELS_DIR / config["file"]
+    if not model_path.exists():
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Model not found: {config['file']}. Download yamnet_edgetpu.tflite from coral.ai"
+        }))]
+
+    # Load model
+    if not engine.load_model(config["file"]):
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Failed to load YamNet model: {config['file']}"
+        }))]
+
+    try:
+        import librosa
+        import scipy.io.wavfile as wavfile
+
+        # Load audio data
+        if "audio_base64" in args:
+            audio_bytes = base64.b64decode(args["audio_base64"])
+            audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            sr = 16000
+        elif "audio_path" in args:
+            audio_path = args["audio_path"]
+            if audio_path.endswith('.wav'):
+                sr_orig, audio_raw = wavfile.read(audio_path)
+                if audio_raw.dtype == np.int16:
+                    audio_data = audio_raw.astype(np.float32) / 32768.0
+                elif audio_raw.dtype == np.float32:
+                    audio_data = audio_raw
+                else:
+                    audio_data = audio_raw.astype(np.float32) / np.max(np.abs(audio_raw))
+                if sr_orig != 16000:
+                    audio_data = librosa.resample(audio_data, orig_sr=sr_orig, target_sr=16000)
+                sr = 16000
+            else:
+                audio_data, sr = librosa.load(audio_path, sr=16000, mono=True)
+        else:
+            return [TextContent(type="text", text=json.dumps({
+                "error": "Must provide audio_base64 or audio_path"
+            }))]
+
+        # YamNet expects 0.975s windows at 16kHz
+        window_length = int(0.975 * sr)  # ~15600 samples
+        hop_length = int(0.975 * sr)  # Non-overlapping
+
+        # Ensure we have enough audio
+        if len(audio_data) < window_length:
+            audio_data = np.pad(audio_data, (0, window_length - len(audio_data)))
+
+        # Process in windows and aggregate predictions
+        all_predictions = []
+        interpreter = engine.interpreters[config["file"]]
+        input_details = interpreter.get_input_details()
+
+        start = time.perf_counter()
+
+        # Get expected input shape
+        expected_shape = input_details[0]["shape"]
+
+        # Process first window (or aggregate multiple)
+        window = audio_data[:window_length]
+
+        # YamNet typically expects mel spectrogram features
+        # Generate 96 mel bands log spectrogram
+        n_fft = 1024
+        hop = 160  # 10ms at 16kHz
+        n_mels = 96
+
+        mel_spec = librosa.feature.melspectrogram(
+            y=window, sr=sr, n_fft=n_fft, hop_length=hop, n_mels=n_mels
+        )
+        log_mel = librosa.power_to_db(mel_spec, ref=np.max)
+
+        # Normalize to match model input
+        log_mel_norm = (log_mel - np.mean(log_mel)) / (np.std(log_mel) + 1e-8)
+
+        # Reshape for model - YamNet expects [1, frames, mels] or similar
+        if len(expected_shape) == 3:
+            target_frames = expected_shape[1]
+            target_mels = expected_shape[2]
+
+            # Resize to match expected shape
+            features = log_mel_norm.T  # Transpose to (time, mels)
+            if features.shape[0] != target_frames:
+                indices = np.linspace(0, features.shape[0]-1, target_frames).astype(int)
+                features = features[indices]
+            if features.shape[1] != target_mels:
+                # Resize mel dimension
+                features = np.array([np.interp(np.linspace(0, len(f)-1, target_mels),
+                                               np.arange(len(f)), f) for f in features])
+
+            features = features.reshape(1, target_frames, target_mels).astype(np.float32)
+
+            # Quantize if needed
+            if input_details[0]["dtype"] == np.uint8:
+                features = ((features - features.min()) / (features.max() - features.min() + 1e-8) * 255).astype(np.uint8)
+        else:
+            # Flatten for simpler input
+            features = log_mel_norm.flatten().astype(np.float32)
+            features = features[:np.prod(expected_shape[1:])].reshape(expected_shape)
+
+        # Run inference
+        from pycoral.adapters import common
+        common.set_input(interpreter, features)
+        interpreter.invoke()
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        # Get predictions
+        output_details = interpreter.get_output_details()
+        scores = interpreter.get_tensor(output_details[0]["index"]).flatten()
+
+        # Load YamNet labels from CSV
+        labels = []
+        labels_path = MODELS_DIR / config["labels"]
+        if labels_path.exists():
+            import csv
+            with open(labels_path, 'r') as f:
+                reader = csv.reader(f)
+                next(reader, None)  # Skip header
+                for row in reader:
+                    if len(row) >= 3:
+                        labels.append(row[2])  # Display name is usually column 3
+                    elif len(row) >= 1:
+                        labels.append(row[0])
+
+        # Get top-k predictions
+        top_indices = np.argsort(scores)[-top_k:][::-1]
+
+        predictions = []
+        for idx in top_indices:
+            label = labels[idx] if idx < len(labels) else f"sound_class_{idx}"
+            predictions.append({
+                "label": label,
+                "class_id": int(idx),
+                "confidence": float(scores[idx])
+            })
+
+        # Update stats
+        engine._update_stats(config["file"], latency_ms, operation="audio_classification")
+
+        return [TextContent(type="text", text=json.dumps({
+            "predictions": predictions,
+            "audio_duration_sec": len(audio_data) / sr,
+            "latency_ms": latency_ms,
+            "num_classes": len(labels) if labels else len(scores),
+            "tpu_used": True
+        }, indent=2))]
+
+    except ImportError as e:
+        return [TextContent(type="text", text=json.dumps({
+            "error": f"Missing audio library: {e}. Install librosa: pip install librosa",
+            "predictions": []
+        }))]
+    except Exception as e:
+        logger.exception("Audio classification error")
+        return [TextContent(type="text", text=json.dumps({
+            "error": str(e),
+            "predictions": []
+        }))]
+
+
+async def handle_list_models(args: Dict) -> List[TextContent]:
+    """List all available TPU models grouped by category."""
+    engine = get_engine()
+
+    # Group models by category
+    by_category = {}
+    for name, config in MODELS.items():
+        category = config.get("category", "other")
+        if category not in by_category:
+            by_category[category] = []
+
+        # Check if model file exists
+        model_path = MODELS_DIR / config["file"]
+        exists = model_path.exists()
+
+        by_category[category].append({
+            "name": name,
+            "file": config["file"],
+            "description": config["description"],
+            "input_size": config["input_size"],
+            "installed": exists,
+            "loaded": config["file"] in engine.interpreters
+        })
+
+    # Summary stats
+    total_models = len(MODELS)
+    installed = sum(1 for name, cfg in MODELS.items() if (MODELS_DIR / cfg["file"]).exists())
+    loaded = len(engine.interpreters)
+
+    return [TextContent(type="text", text=json.dumps({
+        "models_by_category": by_category,
+        "summary": {
+            "total_models": total_models,
+            "installed": installed,
+            "loaded": loaded,
+            "tpu_available": engine.is_available
+        },
+        "models_directory": str(MODELS_DIR)
+    }, indent=2))]
 
 
 async def _load_models_background():
