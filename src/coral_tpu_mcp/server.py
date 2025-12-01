@@ -33,33 +33,117 @@ from .tpu_engine import get_engine, TPUEngine, MODELS_DIR
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Model configurations
+# Model configurations - Comprehensive TPU model library
 MODELS = {
+    # === IMAGE CLASSIFICATION ===
     "mobilenet_v2": {
         "file": "mobilenet_v2_edgetpu.tflite",
         "labels": "imagenet_labels.txt",
         "input_size": (224, 224),
-        "description": "Image classification (1000 ImageNet classes)"
+        "description": "Image classification (1000 ImageNet classes)",
+        "category": "classification"
     },
     "efficientnet_s": {
         "file": "efficientnet_s_edgetpu.tflite",
         "labels": "imagenet_labels.txt",
         "input_size": (224, 224),
-        "description": "Visual embeddings and classification"
+        "description": "Visual embeddings and classification",
+        "category": "classification"
     },
+
+    # === OBJECT DETECTION ===
     "face_detection": {
         "file": "face_detection_edgetpu.tflite",
         "labels": None,
         "input_size": (320, 320),
-        "description": "Face detection"
+        "description": "Face detection",
+        "category": "detection"
     },
+    "coco_detection": {
+        "file": "ssdlite_mobiledet_coco_edgetpu.tflite",
+        "labels": "coco_labels.txt",
+        "input_size": (320, 320),
+        "description": "Object detection (90 COCO classes: person, car, dog, etc.)",
+        "category": "detection"
+    },
+
+    # === POSE ESTIMATION ===
+    "posenet_353": {
+        "file": "posenet_mobilenet_v1_075_353_481_quant_decoder_edgetpu.tflite",
+        "labels": None,
+        "input_size": (353, 481),
+        "description": "Human pose estimation - 17 keypoints (353x481 input)",
+        "category": "pose"
+    },
+    "posenet_481": {
+        "file": "posenet_mobilenet_v1_075_481_641_quant_decoder_edgetpu.tflite",
+        "labels": None,
+        "input_size": (481, 641),
+        "description": "Human pose estimation - 17 keypoints (481x641 input)",
+        "category": "pose"
+    },
+    "posenet_721": {
+        "file": "posenet_mobilenet_v1_075_721_1281_quant_decoder_edgetpu.tflite",
+        "labels": None,
+        "input_size": (721, 1281),
+        "description": "Human pose estimation - 17 keypoints (721x1281 input, highest accuracy)",
+        "category": "pose"
+    },
+    "movenet": {
+        "file": "movenet_single_pose_lightning_edgetpu.tflite",
+        "labels": None,
+        "input_size": (192, 192),
+        "description": "MoveNet Lightning - fast single pose estimation (~30ms)",
+        "category": "pose"
+    },
+
+    # === SEGMENTATION ===
+    "deeplabv3_pascal": {
+        "file": "deeplabv3_pascal_edgetpu.tflite",
+        "labels": "pascal_voc_labels.txt",
+        "input_size": (513, 513),
+        "description": "Semantic segmentation (21 Pascal VOC classes)",
+        "category": "segmentation"
+    },
+    "bodypix": {
+        "file": "bodypix_640x480_edgetpu.tflite",
+        "labels": None,
+        "input_size": (640, 480),
+        "description": "Body segmentation (24 body parts)",
+        "category": "segmentation"
+    },
+
+    # === AUDIO ===
     "keyword_spotter": {
         "file": "keyword_spotter_edgetpu.tflite",
         "labels": None,
         "input_size": None,  # Audio model
-        "description": "Voice command keyword spotting"
+        "description": "Voice command keyword spotting (12 keywords)",
+        "category": "audio"
+    },
+    "keyword_spotter_140": {
+        "file": "keyword_spotter_140_edgetpu.tflite",
+        "labels": "keyword_spotter_labels.txt",
+        "input_size": None,  # Audio model
+        "description": "Enhanced keyword spotting (140+ phrases)",
+        "category": "audio"
+    },
+    "yamnet": {
+        "file": "yamnet_edgetpu.tflite",
+        "labels": "yamnet_class_map.csv",
+        "input_size": None,  # Audio model
+        "description": "Audio classification (520+ sound classes)",
+        "category": "audio"
     }
 }
+
+# Pose keypoint names (17 COCO keypoints)
+POSE_KEYPOINTS = [
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle"
+]
 
 # Text embedding model (CPU-based for now)
 TEXT_EMBEDDING_DIM = 384  # MiniLM dimension
@@ -265,6 +349,109 @@ async def list_tools() -> List[Tool]:
                         "description": "Minimum confidence threshold for detection"
                     }
                 }
+            }
+        ),
+        # === NEW TOOLS ===
+        Tool(
+            name="estimate_pose",
+            description="Estimate human pose from image using TPU. Returns 17 body keypoints (nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles) with confidence scores. Fast (~15-30ms).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "image_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded image data"
+                    },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to image file"
+                    },
+                    "model": {
+                        "type": "string",
+                        "enum": ["movenet", "posenet_353", "posenet_481", "posenet_721"],
+                        "default": "movenet",
+                        "description": "Pose model (movenet=fastest, posenet_721=most accurate)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="detect_objects",
+            description="Detect objects in image using TPU. Returns bounding boxes for 90 COCO classes (person, car, dog, chair, etc.) with confidence scores. Fast (~15ms).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "image_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded image data"
+                    },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to image file"
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "default": 0.4,
+                        "description": "Minimum confidence threshold"
+                    },
+                    "max_detections": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Maximum number of detections to return"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="segment_image",
+            description="Perform semantic segmentation on image using TPU. Returns per-pixel class labels for 21 Pascal VOC classes (person, car, bicycle, etc.). Fast (~25ms).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "image_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded image data"
+                    },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to image file"
+                    },
+                    "return_mask": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Return full segmentation mask (large data)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="classify_audio",
+            description="Classify audio/sounds using YamNet TPU model. Recognizes 520+ sound classes (speech, music, dogs, cars, alarms, etc.). Useful for environment context detection.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "audio_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded raw audio (16-bit PCM)"
+                    },
+                    "audio_path": {
+                        "type": "string",
+                        "description": "Path to audio file"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "default": 5,
+                        "description": "Number of top predictions to return"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="list_models",
+            description="List all available TPU models grouped by category (classification, detection, pose, segmentation, audio).",
+            inputSchema={
+                "type": "object",
+                "properties": {}
             }
         )
     ]

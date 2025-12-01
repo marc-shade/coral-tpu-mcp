@@ -28,7 +28,7 @@ except ImportError:
 # TPU monitor for historical usage tracking
 try:
     import sys as _sys
-    _hooks_path = os.path.join(os.environ.get("AGENTIC_SYSTEM_PATH", "/mnt/agentic-system"), "scripts/hooks")
+    _hooks_path = os.path.join(os.environ.get("AGENTIC_SYSTEM_PATH", "${AGENTIC_SYSTEM_PATH:-/opt/agentic}"), "scripts/hooks")
     if _hooks_path not in _sys.path:
         _sys.path.insert(0, _hooks_path)
     from tpu_monitor import record_tpu_usage as _record_tpu_usage
@@ -41,7 +41,7 @@ from pycoral.adapters import common, classify
 
 logger = logging.getLogger(__name__)
 
-MODELS_DIR = Path(os.path.join(os.environ.get("AGENTIC_SYSTEM_PATH", "/mnt/agentic-system"), "models/coral"))
+MODELS_DIR = Path(os.path.join(os.environ.get("AGENTIC_SYSTEM_PATH", "${AGENTIC_SYSTEM_PATH:-/opt/agentic}"), "models/coral"))
 
 
 @dataclass
