@@ -526,6 +526,12 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         elif name == "list_models":
             return await handle_list_models(arguments)
 
+        elif name == "tpu_health_check":
+            return await handle_tpu_health_check(arguments)
+
+        elif name == "tpu_reconnect":
+            return await handle_tpu_reconnect(arguments)
+
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -1600,6 +1606,77 @@ async def handle_list_models(args: Dict) -> List[TextContent]:
         },
         "models_directory": str(MODELS_DIR)
     }, indent=2))]
+
+
+async def handle_tpu_health_check(args: Dict) -> List[TextContent]:
+    """Check TPU health status and optionally trigger recovery."""
+    engine = get_engine()
+    force_reconnect = args.get("force_reconnect", False)
+
+    # Get current health status
+    health_status = engine.health_check()
+
+    # Force reconnect if requested
+    if force_reconnect:
+        logger.info("Force reconnection requested via health check")
+        reconnect_success = engine.reconnect()
+        health_status["force_reconnect_requested"] = True
+        health_status["reconnect_result"] = "success" if reconnect_success else "failed"
+
+        # Get updated health after reconnect
+        if reconnect_success:
+            health_status.update(engine.health_check())
+
+    # Add recommendations
+    recommendations = []
+    if not health_status.get("is_healthy", False):
+        if health_status.get("consecutive_failures", 0) > 3:
+            recommendations.append("Multiple failures detected - consider restarting TPU device")
+        if health_status.get("last_error"):
+            recommendations.append(f"Last error: {health_status['last_error']}")
+        if not health_status.get("tpu_available", False):
+            recommendations.append("TPU not detected - check USB connection")
+
+    health_status["recommendations"] = recommendations
+
+    return [TextContent(type="text", text=json.dumps(health_status, indent=2))]
+
+
+async def handle_tpu_reconnect(args: Dict) -> List[TextContent]:
+    """Manually trigger TPU reconnection."""
+    engine = get_engine()
+
+    logger.info("Manual TPU reconnection triggered")
+
+    # Get state before reconnect
+    before_available = engine.is_available
+    before_health = engine._get_health_status()
+
+    # Attempt reconnection
+    success = engine.reconnect()
+
+    # Get state after reconnect
+    after_available = engine.is_available
+    after_health = engine._get_health_status()
+
+    result = {
+        "success": success,
+        "before": {
+            "tpu_available": before_available,
+            "was_healthy": before_health.get("is_healthy", False)
+        },
+        "after": {
+            "tpu_available": after_available,
+            "is_healthy": after_health.get("is_healthy", False)
+        },
+        "recovery_attempts": after_health.get("recovery_attempts", 0),
+        "message": "TPU reconnected successfully" if success else "TPU reconnection failed - check device connection"
+    }
+
+    # Add loaded models info
+    result["loaded_models"] = list(engine.interpreters.keys())
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
 async def _load_models_background():
