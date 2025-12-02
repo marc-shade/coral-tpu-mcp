@@ -111,8 +111,31 @@ class TPUEngine:
         self._initializing = False
         self._check_tpu_with_retry()
 
+    def _check_tpu_with_retry(self) -> bool:
+        """Check TPU availability with retry logic."""
+        for attempt in range(RETRY_CONFIG["max_retries"]):
+            if self._check_tpu():
+                self._health.is_healthy = True
+                self._health.last_check = time.time()
+                self._health.consecutive_failures = 0
+                return True
+
+            if attempt < RETRY_CONFIG["max_retries"] - 1:
+                delay = min(
+                    RETRY_CONFIG["initial_delay"] * (RETRY_CONFIG["backoff_factor"] ** attempt),
+                    RETRY_CONFIG["max_delay"]
+                )
+                logger.info(f"TPU check failed, retrying in {delay:.1f}s (attempt {attempt + 1}/{RETRY_CONFIG['max_retries']})")
+                time.sleep(delay)
+                self.stats["retries"] += 1
+
+        logger.warning("TPU initialization failed after all retries - running in degraded mode")
+        self._health.is_healthy = False
+        self._health.last_error = "Failed to initialize TPU after retries"
+        return False
+
     def _check_tpu(self) -> bool:
-        """Check if TPU is available."""
+        """Check if TPU is available (single attempt)."""
         try:
             devices = edgetpu.list_edge_tpus()
             self._tpu_available = len(devices) > 0
@@ -124,7 +147,102 @@ class TPUEngine:
         except Exception as e:
             logger.error(f"Error checking TPU: {e}")
             self._tpu_available = False
+            self._health.last_error = str(e)
             return False
+
+    def reconnect(self) -> bool:
+        """Attempt to reconnect to TPU after failure."""
+        with self._init_lock:
+            if self._initializing:
+                return False
+            self._initializing = True
+
+        try:
+            logger.info("Attempting TPU reconnection...")
+            self._health.recovery_attempts += 1
+
+            # Unload all models first
+            self.interpreters.clear()
+
+            # Wait a moment for any lock to release
+            time.sleep(1.0)
+
+            # Try to reinitialize
+            if self._check_tpu_with_retry():
+                self.stats["recoveries"] += 1
+                logger.info("TPU reconnection successful!")
+                return True
+            else:
+                logger.warning("TPU reconnection failed")
+                return False
+        finally:
+            self._initializing = False
+
+    def health_check(self) -> Dict[str, Any]:
+        """Perform health check and return status."""
+        now = time.time()
+
+        # Skip if checked recently
+        if now - self._health.last_check < HEALTH_CHECK_INTERVAL:
+            return self._get_health_status()
+
+        self._health.last_check = now
+
+        # Try a quick TPU check
+        try:
+            devices = edgetpu.list_edge_tpus()
+            if devices:
+                self._health.is_healthy = True
+                self._health.consecutive_failures = 0
+            else:
+                self._health.is_healthy = False
+                self._health.consecutive_failures += 1
+        except Exception as e:
+            self._health.is_healthy = False
+            self._health.consecutive_failures += 1
+            self._health.last_error = str(e)
+
+        # Auto-reconnect if unhealthy
+        if not self._health.is_healthy and self._health.consecutive_failures >= 3:
+            logger.warning(f"TPU unhealthy after {self._health.consecutive_failures} failures, attempting recovery")
+            self.reconnect()
+
+        return self._get_health_status()
+
+    def _get_health_status(self) -> Dict[str, Any]:
+        """Get current health status."""
+        return {
+            "is_healthy": self._health.is_healthy,
+            "tpu_available": self._tpu_available,
+            "consecutive_failures": self._health.consecutive_failures,
+            "last_error": self._health.last_error,
+            "recovery_attempts": self._health.recovery_attempts,
+            "last_check": self._health.last_check,
+            "last_successful_inference": self._health.last_successful_inference,
+        }
+
+    @contextmanager
+    def _tpu_operation(self, operation_name: str = "inference"):
+        """Context manager for TPU operations with error handling."""
+        if not self._tpu_available:
+            # Try reconnection if TPU not available
+            if not self.reconnect():
+                raise RuntimeError("TPU not available and reconnection failed")
+
+        try:
+            yield
+            self._health.last_successful_inference = time.time()
+            self._health.consecutive_failures = 0
+        except Exception as e:
+            self._health.consecutive_failures += 1
+            self._health.last_error = str(e)
+
+            # Check if it's a device error that might be recoverable
+            error_str = str(e).lower()
+            if "device" in error_str or "usb" in error_str or "delegate" in error_str:
+                logger.warning(f"TPU device error during {operation_name}, will attempt recovery: {e}")
+                self._tpu_available = False
+            raise
 
     @property
     def is_available(self) -> bool:
@@ -133,7 +251,7 @@ class TPUEngine:
 
     def load_model(self, model_name: str, labels_file: Optional[str] = None) -> bool:
         """
-        Load a model onto the TPU.
+        Load a model onto the TPU with retry logic.
 
         Args:
             model_name: Name of the model file (without path)
@@ -142,40 +260,63 @@ class TPUEngine:
         Returns:
             True if model loaded successfully
         """
-        if model_name in self.interpreters:
-            logger.info(f"Model {model_name} already loaded")
-            return True
+        with self._lock:
+            if model_name in self.interpreters:
+                logger.debug(f"Model {model_name} already loaded")
+                return True
 
-        model_path = MODELS_DIR / model_name
-        if not model_path.exists():
-            logger.error(f"Model not found: {model_path}")
-            return False
+            model_path = MODELS_DIR / model_name
+            if not model_path.exists():
+                logger.error(f"Model not found: {model_path}")
+                return False
 
-        try:
-            # Create interpreter with Edge TPU delegate
-            interpreter = edgetpu.make_interpreter(str(model_path))
-            interpreter.allocate_tensors()
+            # Retry loop for model loading
+            last_error = None
+            for attempt in range(RETRY_CONFIG["max_retries"]):
+                try:
+                    # Create interpreter with Edge TPU delegate
+                    interpreter = edgetpu.make_interpreter(str(model_path))
+                    interpreter.allocate_tensors()
 
-            self.interpreters[model_name] = interpreter
+                    self.interpreters[model_name] = interpreter
 
-            # Load labels if provided
-            if labels_file:
-                labels_path = MODELS_DIR / labels_file
-                if labels_path.exists():
-                    self.labels[model_name] = read_label_file(str(labels_path))
-                    logger.info(f"Loaded {len(self.labels[model_name])} labels for {model_name}")
+                    # Load labels if provided
+                    if labels_file:
+                        labels_path = MODELS_DIR / labels_file
+                        if labels_path.exists():
+                            self.labels[model_name] = read_label_file(str(labels_path))
+                            logger.info(f"Loaded {len(self.labels[model_name])} labels for {model_name}")
 
-            # Initialize stats
-            self.stats["by_model"][model_name] = {
-                "inferences": 0,
-                "total_latency_ms": 0
-            }
+                    # Initialize stats
+                    self.stats["by_model"][model_name] = {
+                        "inferences": 0,
+                        "total_latency_ms": 0
+                    }
 
-            logger.info(f"Loaded model: {model_name}")
-            return True
+                    logger.info(f"Loaded model: {model_name}")
+                    self._health.is_healthy = True
+                    return True
 
-        except Exception as e:
-            logger.error(f"Failed to load model {model_name}: {e}")
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Failed to load model {model_name} (attempt {attempt + 1}): {e}")
+
+                    if attempt < RETRY_CONFIG["max_retries"] - 1:
+                        delay = min(
+                            RETRY_CONFIG["initial_delay"] * (RETRY_CONFIG["backoff_factor"] ** attempt),
+                            RETRY_CONFIG["max_delay"]
+                        )
+                        logger.info(f"Retrying model load in {delay:.1f}s...")
+                        time.sleep(delay)
+                        self.stats["retries"] += 1
+
+                        # Try reconnecting if it looks like a device issue
+                        error_str = str(e).lower()
+                        if "device" in error_str or "delegate" in error_str:
+                            self.reconnect()
+
+            logger.error(f"Failed to load model {model_name} after {RETRY_CONFIG['max_retries']} attempts: {last_error}")
+            self._health.last_error = str(last_error)
             return False
 
     def get_input_details(self, model_name: str) -> Optional[Dict]:
@@ -199,7 +340,7 @@ class TPUEngine:
         threshold: float = 0.0
     ) -> InferenceResult:
         """
-        Run classification inference.
+        Run classification inference with resilience.
 
         Args:
             model_name: Model to use
@@ -211,42 +352,65 @@ class TPUEngine:
             InferenceResult with predictions
         """
         if model_name not in self.interpreters:
-            raise ValueError(f"Model not loaded: {model_name}")
+            # Try loading the model with retry
+            if not self.load_model(model_name):
+                raise ValueError(f"Model not loaded and couldn't be loaded: {model_name}")
 
-        interpreter = self.interpreters[model_name]
+        # Retry loop for inference
+        last_error = None
+        for attempt in range(RETRY_CONFIG["max_retries"]):
+            try:
+                with self._tpu_operation("classification"):
+                    interpreter = self.interpreters[model_name]
 
-        # Set input
-        common.set_input(interpreter, input_data)
+                    # Set input
+                    common.set_input(interpreter, input_data)
 
-        # Run inference with timing
-        start = time.perf_counter()
-        interpreter.invoke()
-        latency_ms = (time.perf_counter() - start) * 1000
+                    # Run inference with timing
+                    start = time.perf_counter()
+                    interpreter.invoke()
+                    latency_ms = (time.perf_counter() - start) * 1000
 
-        # Get results
-        classes = classify.get_classes(interpreter, top_k, threshold)
+                    # Get results
+                    classes = classify.get_classes(interpreter, top_k, threshold)
 
-        # Format predictions
-        labels = self.labels.get(model_name, [])
-        predictions = []
-        for c in classes:
-            pred = {
-                "class_id": int(c.id),  # Convert numpy int64 to Python int for JSON
-                "score": float(c.score)
-            }
-            if labels and int(c.id) < len(labels):
-                pred["label"] = labels[int(c.id)]
-            predictions.append(pred)
+                    # Format predictions
+                    labels = self.labels.get(model_name, [])
+                    predictions = []
+                    for c in classes:
+                        pred = {
+                            "class_id": int(c.id),
+                            "score": float(c.score)
+                        }
+                        if labels and int(c.id) < len(labels):
+                            pred["label"] = labels[int(c.id)]
+                        predictions.append(pred)
 
-        # Update stats
-        self._update_stats(model_name, latency_ms, operation="classification")
+                    # Update stats
+                    self._update_stats(model_name, latency_ms, operation="classification")
 
-        return InferenceResult(
-            predictions=predictions,
-            latency_ms=latency_ms,
-            model_name=model_name,
-            timestamp=time.time()
-        )
+                    return InferenceResult(
+                        predictions=predictions,
+                        latency_ms=latency_ms,
+                        model_name=model_name,
+                        timestamp=time.time()
+                    )
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Classification failed (attempt {attempt + 1}): {e}")
+
+                if attempt < RETRY_CONFIG["max_retries"] - 1:
+                    delay = RETRY_CONFIG["initial_delay"] * (RETRY_CONFIG["backoff_factor"] ** attempt)
+                    time.sleep(min(delay, RETRY_CONFIG["max_delay"]))
+                    self.stats["retries"] += 1
+
+                    # Try to reload the model
+                    if model_name in self.interpreters:
+                        del self.interpreters[model_name]
+                    self.load_model(model_name)
+
+        raise RuntimeError(f"Classification failed after {RETRY_CONFIG['max_retries']} attempts: {last_error}")
 
     def get_embedding(
         self,
@@ -255,7 +419,7 @@ class TPUEngine:
         layer_index: int = -2  # Second to last layer usually has embeddings
     ) -> Tuple[np.ndarray, float]:
         """
-        Extract embeddings from a model's intermediate layer.
+        Extract embeddings from a model's intermediate layer with resilience.
 
         For image models, this returns visual feature embeddings.
 
@@ -268,33 +432,55 @@ class TPUEngine:
             Tuple of (embedding array, latency_ms)
         """
         if model_name not in self.interpreters:
-            raise ValueError(f"Model not loaded: {model_name}")
+            if not self.load_model(model_name):
+                raise ValueError(f"Model not loaded and couldn't be loaded: {model_name}")
 
-        interpreter = self.interpreters[model_name]
+        # Retry loop for embedding extraction
+        last_error = None
+        for attempt in range(RETRY_CONFIG["max_retries"]):
+            try:
+                with self._tpu_operation("embedding"):
+                    interpreter = self.interpreters[model_name]
 
-        # Set input
-        common.set_input(interpreter, input_data)
+                    # Set input
+                    common.set_input(interpreter, input_data)
 
-        # Run inference
-        start = time.perf_counter()
-        interpreter.invoke()
-        latency_ms = (time.perf_counter() - start) * 1000
+                    # Run inference
+                    start = time.perf_counter()
+                    interpreter.invoke()
+                    latency_ms = (time.perf_counter() - start) * 1000
 
-        # Get output tensor (embeddings are usually in output)
-        output_details = interpreter.get_output_details()
+                    # Get output tensor (embeddings are usually in output)
+                    output_details = interpreter.get_output_details()
 
-        # Use the specified layer or last layer
-        if abs(layer_index) <= len(output_details):
-            output_detail = output_details[layer_index]
-        else:
-            output_detail = output_details[-1]
+                    # Use the specified layer or last layer
+                    if abs(layer_index) <= len(output_details):
+                        output_detail = output_details[layer_index]
+                    else:
+                        output_detail = output_details[-1]
 
-        embedding = interpreter.get_tensor(output_detail["index"])
+                    embedding = interpreter.get_tensor(output_detail["index"])
 
-        # Update stats
-        self._update_stats(model_name, latency_ms, operation="embedding")
+                    # Update stats
+                    self._update_stats(model_name, latency_ms, operation="embedding")
 
-        return embedding.flatten(), latency_ms
+                    return embedding.flatten(), latency_ms
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Embedding extraction failed (attempt {attempt + 1}): {e}")
+
+                if attempt < RETRY_CONFIG["max_retries"] - 1:
+                    delay = RETRY_CONFIG["initial_delay"] * (RETRY_CONFIG["backoff_factor"] ** attempt)
+                    time.sleep(min(delay, RETRY_CONFIG["max_delay"]))
+                    self.stats["retries"] += 1
+
+                    # Try to reload the model
+                    if model_name in self.interpreters:
+                        del self.interpreters[model_name]
+                    self.load_model(model_name)
+
+        raise RuntimeError(f"Embedding extraction failed after {RETRY_CONFIG['max_retries']} attempts: {last_error}")
 
     def _update_stats(self, model_name: str, latency_ms: float, operation: str = "inference"):
         """Update inference statistics."""
@@ -326,7 +512,7 @@ class TPUEngine:
                 pass  # Don't let monitoring failures affect inference
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get inference statistics."""
+        """Get inference statistics with health information."""
         stats = dict(self.stats)
 
         # Calculate averages
@@ -345,6 +531,17 @@ class TPUEngine:
 
         stats["tpu_available"] = self._tpu_available
         stats["loaded_models"] = list(self.interpreters.keys())
+
+        # Include health status
+        stats["health"] = self._get_health_status()
+
+        # Resilience stats
+        stats["resilience"] = {
+            "retries": self.stats.get("retries", 0),
+            "recoveries": self.stats.get("recoveries", 0),
+            "consecutive_failures": self._health.consecutive_failures,
+            "is_healthy": self._health.is_healthy,
+        }
 
         # Persist stats for cross-process access
         self._persist_stats(stats)

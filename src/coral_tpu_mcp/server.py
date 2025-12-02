@@ -453,6 +453,28 @@ async def list_tools() -> List[Tool]:
                 "type": "object",
                 "properties": {}
             }
+        ),
+        Tool(
+            name="tpu_health_check",
+            description="Check TPU health status and trigger recovery if needed. Returns health metrics, retry counts, and recovery status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "force_reconnect": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Force a reconnection attempt even if healthy"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="tpu_reconnect",
+            description="Manually trigger TPU reconnection. Use when TPU is unresponsive or after device reset.",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
         )
     ]
 
