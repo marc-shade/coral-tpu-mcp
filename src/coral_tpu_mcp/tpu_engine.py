@@ -1,15 +1,24 @@
 """
 TPU Inference Engine - Core inference functionality for Coral Edge TPU.
+
+Resilient design:
+- Retry logic with exponential backoff
+- Health monitoring and auto-reconnect
+- Graceful degradation when TPU unavailable
+- Lock detection and recovery
 """
 
 import os
 import time
 import json
+import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
+import asyncio
+from contextlib import contextmanager
 
 # PyCoral imports
 from pycoral.utils import edgetpu
@@ -43,6 +52,27 @@ logger = logging.getLogger(__name__)
 
 MODELS_DIR = Path(os.path.join(os.environ.get("AGENTIC_SYSTEM_PATH", "${AGENTIC_SYSTEM_PATH:-/opt/agentic}"), "models/coral"))
 
+# Resilience configuration
+RETRY_CONFIG = {
+    "max_retries": 3,
+    "initial_delay": 0.5,  # seconds
+    "max_delay": 10.0,
+    "backoff_factor": 2.0,
+}
+
+HEALTH_CHECK_INTERVAL = 30  # seconds
+
+
+@dataclass
+class TPUHealth:
+    """Track TPU health status."""
+    is_healthy: bool = False
+    last_check: float = 0.0
+    consecutive_failures: int = 0
+    last_error: Optional[str] = None
+    recovery_attempts: int = 0
+    last_successful_inference: float = 0.0
+
 
 @dataclass
 class InferenceResult:
@@ -55,9 +85,13 @@ class InferenceResult:
 
 class TPUEngine:
     """
-    Manages Coral Edge TPU inference.
+    Manages Coral Edge TPU inference with resilience.
 
-    Handles model loading, inference, and statistics tracking.
+    Features:
+    - Retry logic with exponential backoff
+    - Health monitoring and auto-recovery
+    - Graceful degradation when TPU busy
+    - Thread-safe operations
     """
 
     def __init__(self):
@@ -66,10 +100,16 @@ class TPUEngine:
         self.stats = {
             "total_inferences": 0,
             "total_latency_ms": 0,
-            "by_model": {}
+            "by_model": {},
+            "retries": 0,
+            "recoveries": 0,
         }
         self._tpu_available = False
-        self._check_tpu()
+        self._health = TPUHealth()
+        self._lock = threading.RLock()
+        self._init_lock = threading.Lock()
+        self._initializing = False
+        self._check_tpu_with_retry()
 
     def _check_tpu(self) -> bool:
         """Check if TPU is available."""
