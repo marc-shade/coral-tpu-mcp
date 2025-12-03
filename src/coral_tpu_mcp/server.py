@@ -368,9 +368,9 @@ async def list_tools() -> List[Tool]:
                     },
                     "model": {
                         "type": "string",
-                        "enum": ["movenet", "posenet_353", "posenet_481", "posenet_721"],
+                        "enum": ["movenet"],
                         "default": "movenet",
-                        "description": "Pose model (movenet=fastest, posenet_721=most accurate)"
+                        "description": "Pose model (movenet - fast single pose estimation)"
                     }
                 }
             }
@@ -1019,11 +1019,11 @@ async def handle_estimate_pose(args: Dict) -> List[TextContent]:
             "keypoints": []
         }))]
 
-    # Get model
+    # Get model (only movenet supported - posenet requires custom ops not in pycoral)
     model_key = args.get("model", "movenet")
-    if model_key not in ["movenet", "posenet_353", "posenet_481", "posenet_721"]:
+    if model_key not in ["movenet"]:
         return [TextContent(type="text", text=json.dumps({
-            "error": f"Unknown pose model: {model_key}. Use movenet, posenet_353, posenet_481, or posenet_721"
+            "error": f"Unknown pose model: {model_key}. Use movenet (posenet models require unsupported custom ops)"
         }))]
 
     config = MODELS[model_key]
@@ -1685,13 +1685,24 @@ async def _load_models_background():
     engine = get_engine()
     logger.info(f"TPU available: {engine.is_available}")
 
-    # Load models lazily
+    # Models known to be incompatible (custom ops or corrupted)
+    skip_models = {
+        "posenet_353",    # PosenetDecoderOp not supported
+        "posenet_481",    # PosenetDecoderOp not supported
+        "posenet_721",    # PosenetDecoderOp not supported
+        "bodypix",        # Model file corrupted
+    }
+
+    # Load models lazily, skipping known-broken ones
     for model_key, config in MODELS.items():
+        if model_key in skip_models:
+            logger.debug(f"Skipping incompatible model: {model_key}")
+            continue
         if (MODELS_DIR / config["file"]).exists():
             engine.load_model(config["file"], config.get("labels"))
             await asyncio.sleep(0)  # Yield to allow MCP messages
 
-    logger.info("All models loaded")
+    logger.info("All compatible models loaded")
 
 
 async def main():
