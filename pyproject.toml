@@ -31,7 +31,7 @@ dev = [
 ]
 
 [project.scripts]
-coral-tpu-mcp = "coral_tpu_mcp.server:main"
+coral-tpu-mcp = "coral_tpu_mcp.server:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

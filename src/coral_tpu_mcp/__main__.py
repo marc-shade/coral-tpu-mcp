@@ -1,6 +1,5 @@
 """Entry point for running the server as a module."""
-import asyncio
-from .server import main
+from .server import run
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run()
