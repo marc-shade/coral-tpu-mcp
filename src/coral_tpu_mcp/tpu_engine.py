@@ -478,28 +478,67 @@ class TPUEngine:
                 with self._tpu_operation("classification"):
                     interpreter = self.interpreters[model_name]
 
-                    # Set input
-                    common.set_input(interpreter, input_data)
+                    if _TFLITE_AVAILABLE and not _PYCORAL_AVAILABLE:
+                        # ai-edge-litert approach: manual tensor operations
+                        input_details = interpreter.get_input_details()[0]
+                        output_details = interpreter.get_output_details()[0]
 
-                    # Run inference with timing
-                    start = time.perf_counter()
-                    interpreter.invoke()
-                    latency_ms = (time.perf_counter() - start) * 1000
+                        # Set input tensor
+                        interpreter.set_tensor(input_details['index'], input_data)
 
-                    # Get results
-                    classes = classify.get_classes(interpreter, top_k, threshold)
+                        # Run inference with timing
+                        start = time.perf_counter()
+                        interpreter.invoke()
+                        latency_ms = (time.perf_counter() - start) * 1000
 
-                    # Format predictions
-                    labels = self.labels.get(model_name, [])
-                    predictions = []
-                    for c in classes:
-                        pred = {
-                            "class_id": int(c.id),
-                            "score": float(c.score)
-                        }
-                        if labels and int(c.id) < len(labels):
-                            pred["label"] = labels[int(c.id)]
-                        predictions.append(pred)
+                        # Get output scores
+                        output = interpreter.get_tensor(output_details['index'])
+                        scores = np.squeeze(output)
+
+                        # Dequantize if needed
+                        if output_details['dtype'] == np.uint8:
+                            scale, zero_point = output_details['quantization']
+                            scores = (scores.astype(np.float32) - zero_point) * scale
+
+                        # Get top-k results
+                        top_indices = np.argsort(scores)[::-1][:top_k]
+
+                        # Format predictions
+                        labels = self.labels.get(model_name, [])
+                        predictions = []
+                        for idx in top_indices:
+                            score = float(scores[idx])
+                            if score >= threshold:
+                                pred = {
+                                    "class_id": int(idx),
+                                    "score": score
+                                }
+                                if labels and int(idx) < len(labels):
+                                    pred["label"] = labels[int(idx)]
+                                predictions.append(pred)
+                    else:
+                        # pycoral approach
+                        common.set_input(interpreter, input_data)
+
+                        # Run inference with timing
+                        start = time.perf_counter()
+                        interpreter.invoke()
+                        latency_ms = (time.perf_counter() - start) * 1000
+
+                        # Get results
+                        classes = classify.get_classes(interpreter, top_k, threshold)
+
+                        # Format predictions
+                        labels = self.labels.get(model_name, [])
+                        predictions = []
+                        for c in classes:
+                            pred = {
+                                "class_id": int(c.id),
+                                "score": float(c.score)
+                            }
+                            if labels and int(c.id) < len(labels):
+                                pred["label"] = labels[int(c.id)]
+                            predictions.append(pred)
 
                     # Update stats
                     self._update_stats(model_name, latency_ms, operation="classification")
@@ -557,8 +596,13 @@ class TPUEngine:
                 with self._tpu_operation("embedding"):
                     interpreter = self.interpreters[model_name]
 
-                    # Set input
-                    common.set_input(interpreter, input_data)
+                    if _TFLITE_AVAILABLE and not _PYCORAL_AVAILABLE:
+                        # ai-edge-litert approach
+                        input_details = interpreter.get_input_details()[0]
+                        interpreter.set_tensor(input_details['index'], input_data)
+                    else:
+                        # pycoral approach
+                        common.set_input(interpreter, input_data)
 
                     # Run inference
                     start = time.perf_counter()
