@@ -39,16 +39,29 @@ sys.stderr = _original_stderr
 
 @contextmanager
 def _suppress_tflite_output():
-    """Context manager to suppress stdout/stderr (for TFLite XNNPACK messages)."""
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    sys.stdout = io.StringIO()
-    sys.stderr = io.StringIO()
+    """Context manager to suppress stdout/stderr (for TFLite XNNPACK messages).
+
+    Uses OS-level file descriptor redirection to catch native library output.
+    """
+    # Save original file descriptors
+    old_stdout_fd = os.dup(1)
+    old_stderr_fd = os.dup(2)
+
+    # Open /dev/null
+    devnull = os.open(os.devnull, os.O_WRONLY)
+
     try:
+        # Redirect stdout and stderr to /dev/null at OS level
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
         yield
     finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
+        # Restore original file descriptors
+        os.dup2(old_stdout_fd, 1)
+        os.dup2(old_stderr_fd, 2)
+        os.close(devnull)
+        os.close(old_stdout_fd)
+        os.close(old_stderr_fd)
 
 # Shared stats file for cross-process metrics (XRG monitors this file)
 TPU_STATS_FILE = Path("/tmp/xrg-coral-tpu-stats.json")
