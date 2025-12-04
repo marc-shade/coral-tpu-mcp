@@ -9,6 +9,17 @@ Resilient design:
 """
 
 import os
+import sys
+
+# Suppress TensorFlow/TFLite logging before any imports
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
+
+# Redirect stderr temporarily during TFLite import to suppress XNNPACK message
+import io
+_original_stderr = sys.stderr
+sys.stderr = io.StringIO()
+
 import time
 import json
 import threading
@@ -20,8 +31,11 @@ import logging
 import asyncio
 from contextlib import contextmanager
 
-# PyCoral imports
+# PyCoral imports (will trigger TFLite XNNPACK message)
 from pycoral.utils import edgetpu
+
+# Restore stderr
+sys.stderr = _original_stderr
 
 # Shared stats file for cross-process metrics (XRG monitors this file)
 TPU_STATS_FILE = Path("/tmp/xrg-coral-tpu-stats.json")
