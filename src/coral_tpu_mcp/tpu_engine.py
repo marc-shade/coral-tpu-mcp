@@ -26,6 +26,9 @@ from contextlib import contextmanager
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
 
+# Initialize logger early so it's available for import-time messages
+logger = logging.getLogger(__name__)
+
 
 
 @contextmanager
