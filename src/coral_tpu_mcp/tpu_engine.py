@@ -77,19 +77,45 @@ except ImportError:
     _HAS_TPU_MONITOR = False
     _record_tpu_usage = None
 
+# Try ai-edge-litert first (Python 3.10+), then pycoral fallback
+_TFLITE_AVAILABLE = False
+_PYCORAL_AVAILABLE = False
+_EDGETPU_DELEGATE = None
+
 try:
-    from pycoral.utils import edgetpu
-    from pycoral.utils.dataset import read_label_file
-    from pycoral.adapters import common, classify
-    _PYCORAL_AVAILABLE = True
+    # Modern approach: ai-edge-litert with EdgeTPU delegate
+    from ai_edge_litert.interpreter import Interpreter, load_delegate
+    _EDGETPU_DELEGATE = load_delegate('libedgetpu.so.1')
+    _TFLITE_AVAILABLE = True
+    logger.info("Using ai-edge-litert with EdgeTPU delegate")
 except ImportError:
-    _PYCORAL_AVAILABLE = False
-    edgetpu = None
-    read_label_file = None
-    common = None
-    classify = None
+    try:
+        # Fallback: pycoral (Python 3.9 and below)
+        from pycoral.utils import edgetpu
+        from pycoral.utils.dataset import read_label_file
+        from pycoral.adapters import common, classify
+        _PYCORAL_AVAILABLE = True
+        logger.info("Using pycoral for TPU inference")
+    except ImportError:
+        pass
+except Exception as e:
+    logger.warning(f"EdgeTPU delegate failed to load: {e}")
 
 logger = logging.getLogger(__name__)
+
+# Helper function to read label files (works without pycoral)
+def _read_label_file(label_path: str) -> List[str]:
+    """Read labels from a file, one per line."""
+    labels = []
+    with open(label_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            # Handle format with leading numbers (e.g., "0:background")
+            if ':' in line:
+                line = line.split(':', 1)[1].strip()
+            if line:
+                labels.append(line)
+    return labels
 
 MODELS_DIR = Path(os.path.join(os.environ.get("AGENTIC_SYSTEM_PATH", "${AGENTIC_SYSTEM_PATH:-/opt/agentic}"), "models/coral"))
 
@@ -154,10 +180,10 @@ class TPUEngine:
 
     def _check_tpu_with_retry(self) -> bool:
         """Check TPU availability with retry logic."""
-        if not _PYCORAL_AVAILABLE:
+        if not _TFLITE_AVAILABLE and not _PYCORAL_AVAILABLE:
             self._health.is_healthy = False
-            self._health.last_error = "pycoral library not installed"
-            logger.warning("TPU disabled: pycoral library not found")
+            self._health.last_error = "No TPU library available (ai-edge-litert or pycoral)"
+            logger.warning("TPU disabled: No TPU library found")
             return False
 
         for attempt in range(RETRY_CONFIG["max_retries"]):
@@ -183,19 +209,29 @@ class TPUEngine:
 
     def _check_tpu(self) -> bool:
         """Check if TPU is available (single attempt)."""
-        if not _PYCORAL_AVAILABLE:
+        if not _TFLITE_AVAILABLE and not _PYCORAL_AVAILABLE:
             self._tpu_available = False
-            self._health.last_error = "pycoral library not installed"
+            self._health.last_error = "No TPU library available"
             return False
 
         try:
-            devices = edgetpu.list_edge_tpus()
-            self._tpu_available = len(devices) > 0
-            if self._tpu_available:
-                logger.info(f"Found {len(devices)} Edge TPU device(s): {devices}")
+            if _TFLITE_AVAILABLE and _EDGETPU_DELEGATE is not None:
+                # ai-edge-litert: delegate loaded successfully means TPU is available
+                self._tpu_available = True
+                logger.info("Edge TPU available via ai-edge-litert delegate")
+                return True
+            elif _PYCORAL_AVAILABLE:
+                # pycoral approach
+                devices = edgetpu.list_edge_tpus()
+                self._tpu_available = len(devices) > 0
+                if self._tpu_available:
+                    logger.info(f"Found {len(devices)} Edge TPU device(s): {devices}")
+                else:
+                    logger.warning("No Edge TPU devices found")
+                return self._tpu_available
             else:
-                logger.warning("No Edge TPU devices found")
-            return self._tpu_available
+                self._tpu_available = False
+                return False
         except Exception as e:
             logger.error(f"Error checking TPU: {e}")
             self._tpu_available = False
@@ -242,10 +278,18 @@ class TPUEngine:
 
         # Try a quick TPU check
         try:
-            devices = edgetpu.list_edge_tpus()
-            if devices:
+            if _TFLITE_AVAILABLE and _EDGETPU_DELEGATE is not None:
+                # For ai-edge-litert, delegate existence means TPU is available
                 self._health.is_healthy = True
                 self._health.consecutive_failures = 0
+            elif _PYCORAL_AVAILABLE:
+                devices = edgetpu.list_edge_tpus()
+                if devices:
+                    self._health.is_healthy = True
+                    self._health.consecutive_failures = 0
+                else:
+                    self._health.is_healthy = False
+                    self._health.consecutive_failures += 1
             else:
                 self._health.is_healthy = False
                 self._health.consecutive_failures += 1
@@ -312,7 +356,7 @@ class TPUEngine:
         Returns:
             True if model loaded successfully
         """
-        if not _PYCORAL_AVAILABLE:
+        if not _TFLITE_AVAILABLE and not _PYCORAL_AVAILABLE:
             return False
 
         with self._lock:
@@ -332,8 +376,19 @@ class TPUEngine:
                     # Create interpreter with Edge TPU delegate
                     # Suppress stdout/stderr to prevent TFLite XNNPACK messages from confusing MCP clients
                     with _suppress_tflite_output():
-                        interpreter = edgetpu.make_interpreter(str(model_path))
-                        interpreter.allocate_tensors()
+                        if _TFLITE_AVAILABLE and _EDGETPU_DELEGATE is not None:
+                            # ai-edge-litert approach
+                            interpreter = Interpreter(
+                                model_path=str(model_path),
+                                experimental_delegates=[_EDGETPU_DELEGATE]
+                            )
+                            interpreter.allocate_tensors()
+                        elif _PYCORAL_AVAILABLE:
+                            # pycoral approach
+                            interpreter = edgetpu.make_interpreter(str(model_path))
+                            interpreter.allocate_tensors()
+                        else:
+                            raise RuntimeError("No TPU library available")
 
                     self.interpreters[model_name] = interpreter
 
@@ -341,7 +396,10 @@ class TPUEngine:
                     if labels_file:
                         labels_path = MODELS_DIR / labels_file
                         if labels_path.exists():
-                            self.labels[model_name] = read_label_file(str(labels_path))
+                            if _PYCORAL_AVAILABLE and not _TFLITE_AVAILABLE:
+                                self.labels[model_name] = read_label_file(str(labels_path))
+                            else:
+                                self.labels[model_name] = _read_label_file(str(labels_path))
                             logger.info(f"Loaded {len(self.labels[model_name])} labels for {model_name}")
 
                     # Initialize stats
