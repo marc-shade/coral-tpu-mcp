@@ -10,16 +10,7 @@ Resilient design:
 
 import os
 import sys
-
-# Suppress TensorFlow/TFLite logging before any imports
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
-
-# Redirect stderr temporarily during TFLite import to suppress XNNPACK message
 import io
-_original_stderr = sys.stderr
-sys.stderr = io.StringIO()
-
 import time
 import json
 import threading
@@ -31,11 +22,12 @@ import logging
 import asyncio
 from contextlib import contextmanager
 
-# PyCoral imports (will trigger TFLite XNNPACK message)
-from pycoral.utils import edgetpu
+# Suppress TensorFlow/TFLite logging
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
 
-# Restore stderr
-sys.stderr = _original_stderr
+# PyCoral imports
+from pycoral.utils import edgetpu
 
 @contextmanager
 def _suppress_tflite_output():
@@ -85,8 +77,18 @@ try:
 except ImportError:
     _HAS_TPU_MONITOR = False
     _record_tpu_usage = None
-from pycoral.utils.dataset import read_label_file
-from pycoral.adapters import common, classify
+
+try:
+    from pycoral.utils import edgetpu
+    from pycoral.utils.dataset import read_label_file
+    from pycoral.adapters import common, classify
+    _PYCORAL_AVAILABLE = True
+except ImportError:
+    _PYCORAL_AVAILABLE = False
+    edgetpu = None
+    read_label_file = None
+    common = None
+    classify = None
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +155,12 @@ class TPUEngine:
 
     def _check_tpu_with_retry(self) -> bool:
         """Check TPU availability with retry logic."""
+        if not _PYCORAL_AVAILABLE:
+            self._health.is_healthy = False
+            self._health.last_error = "pycoral library not installed"
+            logger.warning("TPU disabled: pycoral library not found")
+            return False
+
         for attempt in range(RETRY_CONFIG["max_retries"]):
             if self._check_tpu():
                 self._health.is_healthy = True
@@ -176,6 +184,11 @@ class TPUEngine:
 
     def _check_tpu(self) -> bool:
         """Check if TPU is available (single attempt)."""
+        if not _PYCORAL_AVAILABLE:
+            self._tpu_available = False
+            self._health.last_error = "pycoral library not installed"
+            return False
+
         try:
             devices = edgetpu.list_edge_tpus()
             self._tpu_available = len(devices) > 0
@@ -300,6 +313,9 @@ class TPUEngine:
         Returns:
             True if model loaded successfully
         """
+        if not _PYCORAL_AVAILABLE:
+            return False
+
         with self._lock:
             if model_name in self.interpreters:
                 logger.debug(f"Model {model_name} already loaded")
