@@ -29,8 +29,11 @@ from mcp.types import Tool, TextContent
 
 from .tpu_engine import get_engine, TPUEngine, MODELS_DIR
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging - Use WARNING to avoid stderr output confusing MCP clients
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(levelname)s:%(name)s:%(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Model configurations - Comprehensive TPU model library
