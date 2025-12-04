@@ -38,13 +38,16 @@ from pycoral.utils import edgetpu
 sys.stderr = _original_stderr
 
 @contextmanager
-def _suppress_stderr():
-    """Context manager to suppress stderr (for TFLite XNNPACK messages)."""
+def _suppress_tflite_output():
+    """Context manager to suppress stdout/stderr (for TFLite XNNPACK messages)."""
+    old_stdout = sys.stdout
     old_stderr = sys.stderr
+    sys.stdout = io.StringIO()
     sys.stderr = io.StringIO()
     try:
         yield
     finally:
+        sys.stdout = old_stdout
         sys.stderr = old_stderr
 
 # Shared stats file for cross-process metrics (XRG monitors this file)
@@ -299,8 +302,8 @@ class TPUEngine:
             for attempt in range(RETRY_CONFIG["max_retries"]):
                 try:
                     # Create interpreter with Edge TPU delegate
-                    # Suppress stderr to prevent TFLite XNNPACK messages from confusing MCP clients
-                    with _suppress_stderr():
+                    # Suppress stdout/stderr to prevent TFLite XNNPACK messages from confusing MCP clients
+                    with _suppress_tflite_output():
                         interpreter = edgetpu.make_interpreter(str(model_path))
                         interpreter.allocate_tensors()
 
