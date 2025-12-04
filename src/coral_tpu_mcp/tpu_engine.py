@@ -26,6 +26,9 @@ from contextlib import contextmanager
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
 
+# PyCoral imports
+from pycoral.utils import edgetpu
+
 @contextmanager
 def _suppress_tflite_output():
     """Context manager to suppress stdout/stderr (for TFLite XNNPACK messages).
