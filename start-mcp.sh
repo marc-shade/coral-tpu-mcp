@@ -5,7 +5,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_PATH="${AGENTIC_SYSTEM_PATH:-/opt/agentic}/coral-venv"
+# Prefer shared venv unless a dedicated Coral venv exists
+VENV_PATH="${AGENTIC_SYSTEM_PATH:-/opt/agentic}/.venv"
+if [ -d "${AGENTIC_SYSTEM_PATH:-/opt/agentic}/coral-venv" ]; then
+  VENV_PATH="${AGENTIC_SYSTEM_PATH:-/opt/agentic}/coral-venv"
+fi
 LOG_FILE="${SCRIPT_DIR}/startup.log"
 
 # Suppress all TensorFlow/TFLite logging

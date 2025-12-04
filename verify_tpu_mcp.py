@@ -2,6 +2,7 @@ import sys
 import os
 import asyncio
 import json
+import traceback
 
 # Add src to path
 sys.path.insert(0, os.path.abspath("src"))
@@ -24,8 +25,10 @@ def test_tpu_engine():
             
     except ImportError as e:
         print(f"Failed to import tpu_engine: {e}")
+        traceback.print_exc() # Print full traceback
     except Exception as e:
         print(f"Error testing engine: {e}")
+        traceback.print_exc() # Print full traceback
 
 def test_text_model():
     print("\n--- Testing Text Model (CPU Fallback) ---")
@@ -42,6 +45,7 @@ def test_text_model():
             print("Text model failed to load.")
     except Exception as e:
         print(f"Error testing text model: {e}")
+        traceback.print_exc() # Print full traceback
 
 if __name__ == "__main__":
     test_tpu_engine()
