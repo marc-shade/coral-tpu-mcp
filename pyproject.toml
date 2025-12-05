@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "Marc", email = "marc@builder.example.local"}
+    {name = "Marc", email = "user@example.com"}
 ]
 keywords = ["coral", "tpu", "mcp", "edge-ml", "inference"]
 
