@@ -13,6 +13,7 @@ import sys
 import io
 import time
 import json
+import hashlib
 import threading
 import numpy as np
 from pathlib import Path
@@ -21,6 +22,89 @@ from dataclasses import dataclass, field
 import logging
 import asyncio
 from contextlib import contextmanager
+
+# Audit logging for security events
+AUDIT_LOG_FILE = Path("/tmp/coral-tpu-audit.log")
+
+def audit_log(event: str, details: Dict[str, Any] = None):
+    """Log security-relevant events for audit trail."""
+    try:
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "event": event,
+            "details": details or {}
+        }
+        with open(AUDIT_LOG_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # Don't let audit failures affect operations
+
+
+def compute_file_checksum(filepath: Path) -> str:
+    """Compute SHA256 checksum of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256_hash.update(chunk)
+    return sha256_hash.hexdigest()
+
+
+def validate_model_file(model_path: Path, manifest_path: Optional[Path] = None) -> Tuple[bool, str]:
+    """
+    Validate model file before loading.
+
+    Args:
+        model_path: Path to the model file
+        manifest_path: Optional path to manifest with expected checksums
+
+    Returns:
+        Tuple of (is_valid, message)
+    """
+    # Check file exists
+    if not model_path.exists():
+        return False, f"Model file not found: {model_path}"
+
+    # Check file extension
+    if not model_path.suffix.lower() in ['.tflite', '.model']:
+        return False, f"Invalid model file extension: {model_path.suffix}"
+
+    # Check file size (reasonable bounds: 1KB - 500MB)
+    file_size = model_path.stat().st_size
+    if file_size < 1024:
+        return False, f"Model file too small ({file_size} bytes), may be corrupted"
+    if file_size > 500 * 1024 * 1024:
+        return False, f"Model file too large ({file_size} bytes), exceeds 500MB limit"
+
+    # Check file is readable
+    try:
+        with open(model_path, 'rb') as f:
+            header = f.read(8)
+            # TFLite files start with specific bytes
+            if len(header) < 8:
+                return False, "Model file too short to validate header"
+    except PermissionError:
+        return False, f"Permission denied reading model file: {model_path}"
+    except Exception as e:
+        return False, f"Error reading model file: {e}"
+
+    # Verify checksum against manifest if provided
+    if manifest_path and manifest_path.exists():
+        try:
+            with open(manifest_path, 'r') as f:
+                manifest = json.load(f)
+
+            model_name = model_path.name
+            if model_name in manifest:
+                expected_checksum = manifest[model_name].get("sha256")
+                if expected_checksum:
+                    actual_checksum = compute_file_checksum(model_path)
+                    if actual_checksum != expected_checksum:
+                        return False, f"Checksum mismatch for {model_name}: expected {expected_checksum[:16]}..., got {actual_checksum[:16]}..."
+        except Exception as e:
+            # Log but don't fail if manifest can't be read
+            audit_log("manifest_read_error", {"error": str(e), "manifest": str(manifest_path)})
+
+    return True, "Model file validated successfully"
 
 # Suppress TensorFlow/TFLite logging
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -368,9 +452,19 @@ class TPUEngine:
                 return True
 
             model_path = MODELS_DIR / model_name
-            if not model_path.exists():
-                logger.error(f"Model not found: {model_path}")
+            manifest_path = MODELS_DIR / "model_manifest.json"
+
+            # Validate model file before loading
+            is_valid, validation_msg = validate_model_file(model_path, manifest_path)
+            if not is_valid:
+                logger.error(f"Model validation failed: {validation_msg}")
+                audit_log("model_validation_failed", {
+                    "model": model_name,
+                    "reason": validation_msg
+                })
                 return False
+
+            audit_log("model_load_start", {"model": model_name, "path": str(model_path)})
 
             # Retry loop for model loading
             last_error = None
@@ -413,6 +507,10 @@ class TPUEngine:
 
                     logger.info(f"Loaded model: {model_name}")
                     self._health.is_healthy = True
+                    audit_log("model_load_success", {
+                        "model": model_name,
+                        "labels_loaded": len(self.labels.get(model_name, []))
+                    })
                     return True
 
                 except Exception as e:
